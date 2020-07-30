@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn.functional import conv1d, conv2d
+from torchaudio.transforms import TimeStretch, FrequencyMasking, TimeMasking
 
 import numpy as np
 import torch
@@ -781,6 +782,265 @@ class iSTFT_complex_2d(torch.nn.Module):
         real = a1-b2
         return (real/self.n_fft, imag/self.n_fft)  
 
+class MelSpectrogram_Conv2d(torch.nn.Module):
+    """This function is to calculate the Melspectrogram of the input signal. Input signal should be in either of the following shapes. 1. ``(len_audio)``, 2. ``(num_audio, len_audio)``, 3. ``(num_audio, 1, len_audio)``. The correct shape will be inferred autommatically if the input follows these 3 shapes. Most of the arguments follow the convention from librosa. This class inherits from ``torch.nn.Module``, therefore, the usage is same as ``torch.nn.Module``.
+
+    Parameters
+    ----------
+    sr : int
+        The sampling rate for the input audio. It is used to calucate the correct ``fmin`` and ``fmax``. Setting the correct sampling rate is very important for calculating the correct frequency.
+
+    n_fft : int
+        The window size for the STFT. Default value is 2048
+
+    n_mels : int
+        The number of Mel filter banks. The filter banks maps the n_fft to mel bins. Default value is 128
+    
+    hop_length : int
+        The hop (or stride) size. Default value is 512.
+
+    window : str
+        The windowing function for STFT. It uses ``scipy.signal.get_window``, please refer to scipy documentation for possible windowing functions. The default value is 'hann'
+
+    center : bool
+        Putting the STFT keneral at the center of the time-step or not. If ``False``, the time index is the beginning of the STFT kernel, if ``True``, the time index is the center of the STFT kernel. Default value if ``True``.
+
+    pad_mode : str
+        The padding method. Default value is 'reflect'.
+
+    htk : bool
+        When ``False`` is used, the Mel scale is quasi-logarithmic. When ``True`` is used, the Mel scale is logarithmic. The default value is ``False`` 
+    
+    fmin : int
+        The starting frequency for the lowest Mel filter bank
+
+    fmax : int
+        The ending frequency for the highest Mel filter bank
+
+    trainable_mel : bool
+        Determine if the Mel filter banks are trainable or not. If ``True``, the gradients for Mel filter banks will also be caluclated and the Mel filter banks will be updated during model training. Default value is ``False``
+
+    trainable_STFT : bool
+        Determine if the STFT kenrels are trainable or not. If ``True``, the gradients for STFT kernels will also be caluclated and the STFT kernels will be updated during model training. Default value is ``False``
+    
+    verbose : bool
+        If ``True``, it shows layer information. If ``False``, it suppresses all prints
+
+    device : str
+        Choose which device to initialize this layer. Default value is 'cuda:0'
+
+    Returns
+    -------
+    spectrogram : torch.tensor
+        It returns a tensor of spectrograms.  shape = ``(num_samples, freq_bins,time_steps)``.
+
+    Examples
+    --------
+    >>> spec_layer = Spectrogram.MelSpectrogram()
+    >>> specs = spec_layer(x)
+    """
+
+    def __init__(self, sr=22050, n_fft=2048, n_mels=128, hop_length=512, window='hann',
+                 center=True, pad_mode='reflect', power=2.0, htk=False, fmin=0.0,
+                 fmax=None, norm=1, trainable_mel=False, trainable_STFT=False,
+                 verbose=True, device='cuda:0', power_to_db=True, fixed_rate=None,
+                 freq_mask_param=60, time_mask_param=30, iid_masks=True, do_specaugment=False):
+
+        super(MelSpectrogram_Conv2d, self).__init__()
+        self.stride = hop_length
+        self.center = center
+        self.pad_mode = pad_mode
+        self.n_fft = n_fft
+        self.device = device
+        self.power = power
+        self.power_to_db = power_to_db
+        self.power2db = Power_to_DB(device=device)
+        self.do_specaugment = do_specaugment
+
+        # Create filter windows for stft
+        start = time()
+        wsin, wcos, self.bins2freq, _ = create_fourier_kernels(n_fft, freq_bins=None, window=window, freq_scale='no', sr=sr)
+        self.wsin = torch.tensor(wsin, dtype=torch.float, device=self.device).unsqueeze(-1)
+        self.wcos = torch.tensor(wcos, dtype=torch.float, device=self.device).unsqueeze(-1)
+        
+
+        # Creating kenral for mel spectrogram
+        start = time()
+        mel_basis = mel(sr, n_fft, n_mels, fmin, fmax, htk=htk, norm=norm)
+        self.mel_basis = torch.tensor(mel_basis, device=self.device)
+
+        if verbose==True:
+            print("STFT filter created, time used = {:.4f} seconds".format(time()-start))
+            print("Mel filter created, time used = {:.4f} seconds".format(time()-start))
+        else:
+            pass
+        # Making everything nn.Prarmeter, so that this model can support nn.DataParallel
+        self.mel_basis = torch.nn.Parameter(self.mel_basis, requires_grad=trainable_mel)
+        self.wsin = torch.nn.Parameter(self.wsin, requires_grad=trainable_STFT)
+        self.wcos = torch.nn.Parameter(self.wcos, requires_grad=trainable_STFT)         
+
+        self.fixed_rate = fixed_rate
+        self.time_stretch = TimeStretch(n_freq=n_fft // 2 + 1, hop_length=hop_length, fixed_rate=fixed_rate).to(device)
+        self.freq_masking = FrequencyMasking(freq_mask_param=freq_mask_param, iid_masks=iid_masks).to(device)
+        self.time_masking = TimeMasking(time_mask_param=time_mask_param, iid_masks=iid_masks).to(device)
+          
+        
+    def forward(self,x):
+        # x = broadcast_dim(x)
+        if self.center:
+            if self.pad_mode == 'constant':
+                padding = nn.ConstantPad2d((0,0,self.n_fft//2, 0))
+            elif self.pad_mode == 'reflect':
+                padding = nn.ReflectionPad2d((0,0,self.n_fft//2,0))
+
+            x = padding(x)
+        
+        
+        spec = torch.sqrt(conv2d(x, self.wsin, stride=self.stride).pow(2) \
+           + conv2d(x, self.wcos, stride=self.stride).pow(2))**self.power # Doing STFT by using conv1d
+        # spec torch.Size([1, 1025, 44]) torch.Size([128, 1025])
+        if self.do_specaugment:
+            spec = spec.T
+            if self.fixed_rate != None:
+                spec = self.time_stretch(spec)
+            spec = self.freq_masking(spec)
+            spec = self.time_masking(spec)
+            spec = spec.T
+        
+        spec = spec.squeeze(-1)
+        melspec = torch.matmul(self.mel_basis, spec)
+        if self.power_to_db:
+            melspec = self.power2db(melspec)
+        return melspec   
+
+class STFT_Conv2d(torch.nn.Module):
+    """This function is to calculate the short-time Fourier transform (STFT) of the input signal. Input signal should be in either of the following shapes. 1. ``(len_audio)``, 2. ``(num_audio, len_audio)``, 3. ``(num_audio, 1, len_audio)``. The correct shape will be inferred autommatically if the input follows these 3 shapes. Most of the arguments follow the convention from librosa. This class inherits from ``torch.nn.Module``, therefore, the usage is same as ``torch.nn.Module``.
+
+    Parameters
+    ----------
+    n_fft : int
+        The window size. Default value is 2048. 
+
+    freq_bins : int
+        Number of frequency bins. Default is ``None``, which means ``n_fft//2+1`` bins
+    
+    hop_length : int
+        The hop (or stride) size. Default value is 512.
+
+    window : str
+        The windowing function for STFT. It uses ``scipy.signal.get_window``, please refer to scipy documentation for possible windowing functions. The default value is 'hann'
+
+    freq_scale : 'linear', 'log', or 'no'
+        Determine the spacing between each frequency bin. When `linear` or `log` is used, the bin spacing can be controlled by ``fmin`` and ``fmax``. If 'no' is used, the bin will start at 0Hz and end at Nyquist frequency with linear spacing.
+
+    center : bool
+        Putting the STFT keneral at the center of the time-step or not. If ``False``, the time index is the beginning of the STFT kernel, if ``True``, the time index is the center of the STFT kernel. Default value if ``True``.
+
+    pad_mode : str
+        The padding method. Default value is 'reflect'.
+    
+    fmin : int
+        The starting frequency for the lowest frequency bin. If freq_scale is ``no``, this argument does nothing.
+
+    fmax : int
+        The ending frequency for the highest frequency bin. If freq_scale is ``no``, this argument does nothing.
+
+    sr : int
+        The sampling rate for the input audio. It is used to calucate the correct ``fmin`` and ``fmax``. Setting the correct sampling rate is very important for calculating the correct frequency.
+
+    trainable : bool
+        Determine if the STFT kenrels are trainable or not. If ``True``, the gradients for STFT kernels will also be caluclated and the STFT kernels will be updated during model training. Default value is ``False``
+
+    output_format : str
+        Determine the return type. ``Magnitude`` will return the magnitude of the STFT result, shape = ``(num_samples, freq_bins,time_steps)``; ``Complex`` will return the STFT result in complex number, shape = ``(num_samples, freq_bins,time_steps, 2)``; ``Phase`` will return the phase of the STFT reuslt, shape = ``(num_samples, freq_bins,time_steps, 2)``. The complex number is stored as ``(real, imag)`` in the last axis. Default value is 'Magnitude'. 
+
+    verbose : bool
+        If ``True``, it shows layer information. If ``False``, it suppresses all prints
+
+    device : str
+        Choose which device to initialize this layer. Default value is 'cuda:0'
+
+    Returns
+    -------
+    spectrogram : torch.tensor
+        It returns a tensor of spectrograms.  shape = ``(num_samples, freq_bins,time_steps)`` if 'Magnitude' is used as the ``output_format``; Shape = ``(num_samples, freq_bins,time_steps, 2)`` if 'Complex' or 'Phase' are used as the ``output_format``
+
+    Examples
+    --------
+    >>> spec_layer = Spectrogram.STFT()
+    >>> specs = spec_layer(x)
+    """
+    def __init__(self, n_fft=2048, freq_bins=None, hop_length=512, window='hann', freq_scale='no', center=True, pad_mode='reflect', fmin=50,fmax=6000, sr=22050, trainable=False, output_format='Magnitude', verbose=True, device='cuda:0'):
+        self.trainable = trainable
+        super(STFT_Conv2d, self).__init__()
+        self.stride = hop_length
+        self.center = center
+        self.pad_mode = pad_mode
+        self.n_fft = n_fft
+        self.trainable = trainable
+        self.output_format=output_format
+        self.device = device
+        start = time()
+        # Create filter windows for stft
+        wsin, wcos, self.bins2freq, self.bin_list = create_fourier_kernels(n_fft, freq_bins=freq_bins, window=window, freq_scale=freq_scale, fmin=fmin,fmax=fmax, sr=sr)
+        self.wsin = torch.tensor(wsin, dtype=torch.float, device=self.device).unsqueeze(-1)
+        self.wcos = torch.tensor(wcos, dtype=torch.float, device=self.device).unsqueeze(-1)
+
+        # Making all these variables nn.Parameter, so that the model can be used with nn.Parallel
+        self.wsin = torch.nn.Parameter(self.wsin, requires_grad=self.trainable)
+        self.wcos = torch.nn.Parameter(self.wcos, requires_grad=self.trainable)
+
+        # if self.trainable==True:
+        #     self.wsin = torch.nn.Parameter(self.wsin)
+        #     self.wcos = torch.nn.Parameter(self.wcos)
+
+        if verbose==True:
+            print("STFT kernels created, time used = {:.4f} seconds".format(time()-start))
+        else:
+            pass
+
+    def forward(self,x):
+        # x:1,1,250,1
+        spec_imag = conv2d(x, self.wsin, stride=(self.stride,1)) 
+        spec_real = conv2d(x, self.wcos, stride=(self.stride,1)) # Doing STFT by using conv2d
+        
+        if self.output_format=='Magnitude':
+            spec = spec_real.pow(2) + spec_imag.pow(2)
+            if self.trainable==True:
+                return torch.sqrt(spec+1e-8) # prevent Nan gradient when sqrt(0) due to output=0
+            else:
+                return torch.sqrt(spec)
+        elif self.output_format=='Complex':
+            return torch.stack((spec_real,-spec_imag), -1) # Remember the minus sign for imaginary part
+            
+        elif self.output_format=='Phase':
+            return torch.atan2(-spec_imag+0.0,spec_real) # +0.0 helps remove -0.0 elements, which leads to error in calcuating pahse
+
+            # This part is for implementing the librosa.core.magphase
+            # But it seems it is not useful
+            # phase_real = torch.cos(torch.atan2(spec_imag,spec_real))
+            # phase_imag = torch.sin(torch.atan2(spec_imag,spec_real))
+            # return torch.stack((phase_real,phase_imag), -1)
+
+class Power_to_DB(torch.nn.Module):
+    # refer to https://librosa.github.io/librosa/_modules/librosa/core/spectrum.html#power_to_db for the original implmentation
+    def __init__(self, ref=1.0, amin=1e-10, top_db=80.0, device='cpu'):
+        super(Power_to_DB, self).__init__()
+        if amin <= 0:
+            raise ParameterError('amin must be strictly positive')
+        self.amin = torch.tensor([amin], device=device)
+        self.ref = torch.abs(torch.tensor([ref], device=device))
+        self.top_db = top_db
+
+    def forward(self, S):
+        log_spec = 10.0 * torch.log10(torch.max(S, self.amin))
+        log_spec -= 10.0 * torch.log10(torch.max(self.amin, self.ref))
+        if self.top_db is not None:
+            if self.top_db < 0:
+                raise ParameterError('top_db must be non-negative')
+            batch_wise_max = log_spec.flatten(1).max(1)[0].unsqueeze(1).unsqueeze(1) # make the dim same as log_spec so that it can be boardcaseted
+            log_spec = torch.max(log_spec, batch_wise_max - self.top_db)       
+        return log_spec
 
 class MelSpectrogram(torch.nn.Module):
     """This function is to calculate the Melspectrogram of the input signal. 
